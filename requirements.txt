@@ -29,6 +29,6 @@ optimum-quanto
 sentencepiece
 huggingface_hub
 peft
-gradio
+gradio==5.23.2
 python-slugify
 imagesize
