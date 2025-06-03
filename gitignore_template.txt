@@ -1,0 +1,64 @@
+# API Keys and Configuration
+config.json
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Generated files
+generated_captions/
+datasets/
+outputs/
+models/
+*.safetensors
+*.ckpt
+*.bin
+
+# Training files
+train.sh
+train.bat
+dataset.toml
+sample_prompts.txt
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp 

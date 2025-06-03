@@ -1,0 +1,19 @@
+{
+  "api_keys": {
+    "google_api_key": "YOUR_GOOGLE_API_KEY_HERE"
+  },
+  "settings": {
+    "max_images": 150,
+    "default_resolution": 512,
+    "default_epochs": 16,
+    "default_learning_rate": "8e-4",
+    "default_network_dim": 4,
+    "default_vram": "20G"
+  },
+  "paths": {
+    "models_dir": "models",
+    "outputs_dir": "outputs",
+    "datasets_dir": "datasets",
+    "captions_dir": "generated_captions"
+  }
+} 

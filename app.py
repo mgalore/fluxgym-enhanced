@@ -1,10 +1,33 @@
 import os
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 import sys
 import subprocess
+import logging
+import traceback
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Set HF environment variable
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # Add the current working directory to the Python path
 sys.path.insert(0, os.getcwd())
+
+# Import configuration loader
+try:
+    from config_loader import config, ConfigurationError
+except ImportError:
+    logger.error("config_loader.py not found. Please ensure it exists in the same directory.")
+    sys.exit(1)
+
+# Auto-install google-generativeai if not available
+try:
+    import google.generativeai as genai
+except ImportError:
+    logger.info("Installing google-generativeai...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "google-generativeai"])
+    import google.generativeai as genai
 
 import gradio as gr
 from PIL import Image
@@ -14,147 +37,449 @@ import shutil
 import json
 import yaml
 from slugify import slugify
-from transformers import AutoProcessor, AutoModelForCausalLM
 from gradio_logsview import LogsView, LogsViewRunner
 from huggingface_hub import hf_hub_download
 
-MAX_IMAGES = 150
+# Load configuration settings
+try:
+    GOOGLE_API_KEY = config.get_api_key("google_api_key")
+    MAX_IMAGES = config.get_setting("max_images", 150)
+    logger.info("Configuration loaded successfully")
+except ConfigurationError as e:
+    logger.error(f"Configuration error: {e}")
+    logger.error("Please check your config.json file or set environment variables.")
+    # Show helpful message to user
+    print("\n" + "="*60)
+    print("CONFIGURATION ERROR")
+    print("="*60)
+    print(f"Error: {e}")
+    print("\nTo fix this issue:")
+    print("1. Copy config.json and update with your Google API key, OR")
+    print("2. Set environment variable: GOOGLE_API_KEY=your_api_key")
+    print("3. You can get a Google API key from: https://makersuite.google.com/app/apikey")
+    print("="*60)
+    sys.exit(1)
 
 def load_captioning(uploaded_files, concept_sentence):
-    uploaded_images = [file for file in uploaded_files if not file.endswith('.txt')]
-    txt_files = [file for file in uploaded_files if file.endswith('.txt')]
-    txt_files_dict = {os.path.splitext(os.path.basename(txt_file))[0]: txt_file for txt_file in txt_files}
-    updates = []
-    if len(uploaded_images) <= 1:
-        raise gr.Error(
-            "Please upload at least 2 images to train your model (the ideal number with default settings is between 4-30)"
-        )
-    elif len(uploaded_images) > MAX_IMAGES:
-        raise gr.Error(f"For now, only {MAX_IMAGES} or less images are allowed for training")
-    # Update for the captioning_area
-    # for _ in range(3):
-    updates.append(gr.update(visible=True))
-    # Update visibility and image for each captioning row and image
-    for i in range(1, MAX_IMAGES + 1):
-        # Determine if the current row and image should be visible
-        visible = i <= len(uploaded_images)
+    """Load and process uploaded files for captioning."""
+    try:
+        uploaded_images = [file for file in uploaded_files if not file.endswith('.txt')]
+        txt_files = [file for file in uploaded_files if file.endswith('.txt')]
+        txt_files_dict = {os.path.splitext(os.path.basename(txt_file))[0]: txt_file for txt_file in txt_files}
+        updates = []
+        
+        # Check for existing images in dataset folder if no uploads
+        if len(uploaded_images) == 0:
+            # Look for existing images in dataset folders
+            datasets_dir = config.get_path("datasets_dir", "datasets")
+            existing_images = []
+            
+            if os.path.exists(datasets_dir):
+                for folder in os.listdir(datasets_dir):
+                    folder_path = os.path.join(datasets_dir, folder)
+                    if os.path.isdir(folder_path):
+                        for file in os.listdir(folder_path):
+                            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
+                                existing_images.append(os.path.join(folder_path, file))
+            
+            if existing_images:
+                uploaded_images = existing_images[:MAX_IMAGES]  # Limit to MAX_IMAGES
+                gr.Info(f"Found {len(existing_images)} existing images in dataset folders. Using first {len(uploaded_images)} for captioning.")
+        
+        if len(uploaded_images) <= 1:
+            raise gr.Error(
+                "Please upload at least 2 images to train your model (the ideal number with default settings is between 4-30), or copy images directly to datasets/[lora-name]/ folder"
+            )
+        elif len(uploaded_images) > MAX_IMAGES:
+            raise gr.Error(f"For now, only {MAX_IMAGES} or less images are allowed for training")
+        
+        # Update for the captioning_area
+        updates.append(gr.update(visible=True))
+        
+        # Update visibility and image for each captioning row and image
+        for i in range(1, MAX_IMAGES + 1):
+            # Determine if the current row and image should be visible
+            visible = i <= len(uploaded_images)
 
-        # Update visibility of the captioning row
-        updates.append(gr.update(visible=visible))
+            # Update visibility of the captioning row
+            updates.append(gr.update(visible=visible))
 
-        # Update for image component - display image if available, otherwise hide
-        image_value = uploaded_images[i - 1] if visible else None
-        updates.append(gr.update(value=image_value, visible=visible))
+            # Update for image component - display image if available, otherwise hide
+            image_value = uploaded_images[i - 1] if visible else None
+            updates.append(gr.update(value=image_value, visible=visible))
 
-        corresponding_caption = False
-        if(image_value):
-            base_name = os.path.splitext(os.path.basename(image_value))[0]
-            if base_name in txt_files_dict:
-                with open(txt_files_dict[base_name], 'r') as file:
-                    corresponding_caption = file.read()
+            corresponding_caption = False
+            if(image_value):
+                base_name = os.path.splitext(os.path.basename(image_value))[0]
+                # Check for existing caption file
+                caption_file_path = os.path.join(os.path.dirname(image_value), f"{base_name}.txt")
+                if os.path.exists(caption_file_path):
+                    with open(caption_file_path, 'r', encoding='utf-8') as file:
+                        corresponding_caption = file.read()
+                elif base_name in txt_files_dict:
+                    with open(txt_files_dict[base_name], 'r', encoding='utf-8') as file:
+                        corresponding_caption = file.read()
 
-        # Update value of captioning area
-        text_value = corresponding_caption if visible and corresponding_caption else concept_sentence if visible and concept_sentence else None
-        updates.append(gr.update(value=text_value, visible=visible))
+            # Update value of captioning area
+            text_value = corresponding_caption if visible and corresponding_caption else concept_sentence if visible and concept_sentence else None
+            updates.append(gr.update(value=text_value, visible=visible))
 
-    # Update for the sample caption area
-    updates.append(gr.update(visible=True))
-    updates.append(gr.update(visible=True))
+        # Update for the sample caption area
+        updates.append(gr.update(visible=True))
+        updates.append(gr.update(visible=True))
 
-    return updates
+        return updates
+    except Exception as e:
+        logger.error(f"Error in load_captioning: {e}")
+        raise gr.Error(f"Error loading captioning: {str(e)}")
 
 def hide_captioning():
+    """Hide captioning interface."""
     return gr.update(visible=False), gr.update(visible=False)
 
 def resize_image(image_path, output_path, size):
-    with Image.open(image_path) as img:
-        width, height = img.size
-        if width < height:
-            new_width = size
-            new_height = int((size/width) * height)
-        else:
-            new_height = size
-            new_width = int((size/height) * width)
-        print(f"resize {image_path} : {new_width}x{new_height}")
-        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        img_resized.save(output_path)
+    """Resize image to specified size while maintaining aspect ratio."""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            if width < height:
+                new_width = size
+                new_height = int((size/width) * height)
+            else:
+                new_height = size
+                new_width = int((size/height) * width)
+            logger.info(f"Resizing {image_path}: {new_width}x{new_height}")
+            img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            img_resized.save(output_path)
+    except Exception as e:
+        logger.error(f"Error resizing image {image_path}: {e}")
+        raise
 
 def create_dataset(destination_folder, size, *inputs):
-    print("Creating dataset")
-    images = inputs[0]
-    if not os.path.exists(destination_folder):
-        os.makedirs(destination_folder)
+    """Create dataset from uploaded images and captions."""
+    try:
+        logger.info("Creating dataset")
+        images = inputs[0]
+        
+        if not os.path.exists(destination_folder):
+            os.makedirs(destination_folder)
 
-    for index, image in enumerate(images):
-        # copy the images to the datasets folder
-        new_image_path = shutil.copy(image, destination_folder)
+        # Check if images already exist in the destination folder
+        existing_images = []
+        if os.path.exists(destination_folder):
+            for file in os.listdir(destination_folder):
+                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
+                    existing_images.append(os.path.join(destination_folder, file))
+        
+        # If images already exist in folder and no new uploads, use existing images
+        if existing_images and (not images or len(images) == 0):
+            logger.info(f"Found {len(existing_images)} existing images in {destination_folder}")
+            logger.info("Using existing images in dataset folder")
+            
+            # Resize existing images if needed
+            for image_path in existing_images:
+                resize_image(image_path, image_path, size)
+                
+            return destination_folder
 
-        # resize the images
-        resize_image(new_image_path, new_image_path, size)
+        # Process uploaded images (original behavior)
+        for index, image in enumerate(images):
+            # Copy the images to the datasets folder
+            new_image_path = shutil.copy(image, destination_folder)
 
-        # copy the captions
+            # Resize the images
+            resize_image(new_image_path, new_image_path, size)
 
-        original_caption = inputs[index + 1]
+            # Copy the captions
+            original_caption = inputs[index + 1]
 
-        image_file_name = os.path.basename(new_image_path)
-        caption_file_name = os.path.splitext(image_file_name)[0] + ".txt"
-        caption_path = resolve_path_without_quotes(os.path.join(destination_folder, caption_file_name))
-        print(f"image_path={new_image_path}, caption_path = {caption_path}, original_caption={original_caption}")
-        with open(caption_path, 'w') as file:
-            file.write(original_caption)
+            image_file_name = os.path.basename(new_image_path)
+            caption_file_name = os.path.splitext(image_file_name)[0] + ".txt"
+            caption_path = resolve_path_without_quotes(os.path.join(destination_folder, caption_file_name))
+            logger.info(f"Image: {new_image_path}, Caption: {caption_path}")
+            
+            with open(caption_path, 'w', encoding='utf-8') as file:
+                file.write(original_caption)
 
-    print(f"destination_folder {destination_folder}")
-    return destination_folder
-
+        logger.info(f"Dataset created at: {destination_folder}")
+        return destination_folder
+    except Exception as e:
+        logger.error(f"Error creating dataset: {e}")
+        raise gr.Error(f"Error creating dataset: {str(e)}")
 
 def run_captioning(images, concept_sentence, *captions):
-    print(f"run_captioning")
-    print(f"concept sentence {concept_sentence}")
-    print(f"captions {captions}")
-    #Load internally to not consume resources for training
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device={device}")
-    torch_dtype = torch.float16
-    model = AutoModelForCausalLM.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
-    ).to(device)
-    processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
+    """Generate captions using Google Gemini API."""
+    try:
+        logger.info("Starting Gemini AI captioning...")
+        
+        # Configure Google Gemini API
+        genai.configure(api_key=GOOGLE_API_KEY)
+        
+        # Initialize Gemini model
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Load system prompt from file
+        system_prompt_file = "system_prompt.txt"
+        try:
+            with open(system_prompt_file, 'r', encoding='utf-8') as f:
+                system_prompt = f.read().strip()
+            logger.info(f"Loaded system prompt from {system_prompt_file}")
+        except FileNotFoundError:
+            logger.warning(f"System prompt file {system_prompt_file} not found, using fallback")
+            # Fallback prompt if file is missing
+            system_prompt = """You are Caption-AI, a specialized assistant that converts street-fashion images into prompt-style captions for LoRA fine-tuning.
+Follow the exact rules below for every image you receive.
+Return one single-line, comma-separated caption, all lowercase, no periods.
 
-    captions = list(captions)
-    for i, image_path in enumerate(images):
-        print(captions[i])
-        if isinstance(image_path, str):  # If image is a file path
-            image = Image.open(image_path).convert("RGB")
+Please analyze the image and write a caption that includes structured information based on the fashion image provided.
+Include subject type, framing, pose, outfit description, clothing style tag, accessories, location, lighting, and camera details.
+Keep the caption concise but descriptive for training purposes."""
 
-        prompt = "<DETAILED_CAPTION>"
-        inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch_dtype)
-        print(f"inputs {inputs}")
+        captions = list(captions)
+        
+        # Create captions directory if it doesn't exist
+        captions_dir = config.get_path("captions_dir", "generated_captions")
+        os.makedirs(captions_dir, exist_ok=True)
+        
+        # Prepare master captions file
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        master_captions_file = os.path.join(captions_dir, f"all_captions_{timestamp}.txt")
+        
+        # List to store all captions for the master file
+        all_captions_data = []
+        
+        logger.info("🚀 Starting Gemini AI captioning...")
+        
+        for i, image_path in enumerate(images):
+            logger.info(f"Processing image {i+1}/{len(images)}: {os.path.basename(image_path)}")
+            if isinstance(image_path, str):  # If image is a file path
+                image_pil = Image.open(image_path).convert("RGB")
 
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"], max_new_tokens=1024, num_beams=3
-        )
-        print(f"generated_ids {generated_ids}")
+            try:
+                # Prepare the prompt with concept sentence if provided
+                final_prompt = system_prompt
+                if concept_sentence:
+                    final_prompt += f"\n\nNote: Use '{concept_sentence}' as the clothing style tag and trigger word."
+                
+                # Generate caption using Gemini
+                logger.info(f"📸 Analyzing image with Gemini...")
+                response = model.generate_content([final_prompt, image_pil])
+                
+                if response.text:
+                    structured_caption = response.text.strip()
+                    
+                    # Clean up the response (remove any extra formatting)
+                    structured_caption = structured_caption.replace('\n', ' ').replace('\r', ' ')
+                    # Remove any markdown formatting
+                    structured_caption = structured_caption.replace('**', '').replace('*', '')
+                    
+                    logger.info(f"✅ Caption generated: {structured_caption[:100]}...")
+                    
+                else:
+                    # Fallback if Gemini doesn't respond
+                    structured_caption = f"person, full-body, standing, casual wear, {concept_sentence if concept_sentence else 'streetwear_core'}, neutral tones, cotton, eye-level, DSLR, portrait lens, natural light, daylight, outdoor, urban setting, solo, lookbook style, casual vibe, {concept_sentence if concept_sentence else 'streetwear_core'}"
+                    logger.warning("⚠️ Gemini didn't provide a response, using fallback caption")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error with Gemini API: {e}")
+                # Fallback caption
+                structured_caption = f"person, full-body, standing, casual wear, {concept_sentence if concept_sentence else 'streetwear_core'}, neutral tones, cotton, eye-level, DSLR, portrait lens, natural light, daylight, outdoor, urban setting, solo, lookbook style, casual vibe, {concept_sentence if concept_sentence else 'streetwear_core'}"
+            
+            captions[i] = structured_caption
+            
+            # Save individual caption file
+            image_filename = os.path.basename(image_path)
+            image_name = os.path.splitext(image_filename)[0]
+            caption_filename = f"{image_name}_caption.txt"
+            caption_filepath = os.path.join(captions_dir, caption_filename)
+            
+            with open(caption_filepath, 'w', encoding='utf-8') as f:
+                f.write(structured_caption)
+            
+            # Store data for master file
+            all_captions_data.append({
+                'image_path': image_path,
+                'image_filename': image_filename,
+                'structured_caption': structured_caption
+            })
+            
+            logger.info(f"💾 Saved caption to: {caption_filename}")
 
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        print(f"generated_text: {generated_text}")
-        parsed_answer = processor.post_process_generation(
-            generated_text, task=prompt, image_size=(image.width, image.height)
-        )
-        print(f"parsed_answer = {parsed_answer}")
-        caption_text = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-        print(f"caption_text = {caption_text}, concept_sentence={concept_sentence}")
-        if concept_sentence:
-            caption_text = f"{concept_sentence} {caption_text}"
-        captions[i] = caption_text
+            yield captions
+        
+        # Save master captions file with all captions
+        with open(master_captions_file, 'w', encoding='utf-8') as f:
+            f.write("# Generated Captions Report (Gemini)\n")
+            f.write(f"# Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# API Key used: {GOOGLE_API_KEY[:20]}...\n")
+            f.write(f"# Concept sentence: {concept_sentence}\n")
+            f.write(f"# Total images processed: {len(all_captions_data)}\n")
+            f.write(f"# Format: Image Filename | Structured Caption\n")
+            f.write("="*80 + "\n\n")
+            
+            for data in all_captions_data:
+                f.write(f"Image: {data['image_filename']}\n")
+                f.write(f"Path: {data['image_path']}\n")
+                f.write(f"Structured Caption: {data['structured_caption']}\n")
+                f.write("-" * 80 + "\n\n")
+            
+            # Also create a simple format for easy copy-paste
+            f.write("\n" + "="*80 + "\n")
+            f.write("# SIMPLE FORMAT (for easy copy-paste)\n")
+            f.write("="*80 + "\n\n")
+            
+            for data in all_captions_data:
+                f.write(f"{data['image_filename']}: {data['structured_caption']}\n")
+        
+        logger.info(f"🎉 Master captions file saved to: {master_captions_file}")
+        logger.info(f"📁 Individual caption files saved in: {captions_dir}")
+        logger.info("✨ Gemini captioning completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"Error in run_captioning: {e}")
+        logger.error(traceback.format_exc())
+        raise gr.Error(f"Error running captioning: {str(e)}")
 
-        yield captions
-    model.to("cpu")
-    del model
-    del processor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+def convert_to_structured_format(raw_caption, concept_sentence):
+    """
+    Convert Florence's natural language description to the structured 16-part format
+    This is a simplified conversion - you may want to enhance this with more sophisticated parsing
+    """
+    
+    # Default values for the 16 fields
+    fields = {
+        'subject': 'person',
+        'framing': 'full-body',
+        'pose': 'standing',
+        'outfit': 'casual wear',
+        'style_tag': concept_sentence if concept_sentence else 'streetwear_core',
+        'color': 'neutral tones',
+        'texture': 'cotton',
+        'angle': 'eye-level',
+        'camera': 'DSLR',
+        'lens': 'portrait lens',
+        'lighting': 'natural light',
+        'time': 'daylight',
+        'location': 'outdoor',
+        'backdrop': 'urban setting',
+        'composition': 'solo',
+        'style': 'lookbook style'
+    }
+    
+    # Simple keyword matching to extract information from raw caption
+    raw_lower = raw_caption.lower()
+    
+    # Subject detection
+    if 'woman' in raw_lower or 'female' in raw_lower:
+        fields['subject'] = 'female model'
+    elif 'man' in raw_lower or 'male' in raw_lower:
+        fields['subject'] = 'male model'
+    elif 'people' in raw_lower or 'group' in raw_lower:
+        fields['subject'] = 'group'
+    
+    # Framing detection
+    if 'close-up' in raw_lower or 'portrait' in raw_lower:
+        fields['framing'] = 'close-up'
+    elif 'full body' in raw_lower or 'full-body' in raw_lower:
+        fields['framing'] = 'full-body'
+    elif 'back' in raw_lower:
+        fields['framing'] = 'back view'
+    
+    # Pose detection
+    if 'sitting' in raw_lower:
+        fields['pose'] = 'sitting'
+    elif 'walking' in raw_lower:
+        fields['pose'] = 'walking'
+    elif 'arms crossed' in raw_lower:
+        fields['pose'] = 'arms crossed'
+    elif 'hands in pockets' in raw_lower:
+        fields['pose'] = 'hands in pockets'
+    
+    # Outfit detection
+    if 'hoodie' in raw_lower:
+        fields['outfit'] = 'hoodie'
+    elif 't-shirt' in raw_lower or 'tee' in raw_lower:
+        fields['outfit'] = 'tee'
+    elif 'jacket' in raw_lower:
+        fields['outfit'] = 'jacket'
+    elif 'dress' in raw_lower:
+        fields['outfit'] = 'dress'
+    
+    # Color detection
+    if 'black' in raw_lower:
+        fields['color'] = 'black palette'
+    elif 'white' in raw_lower:
+        fields['color'] = 'white palette'
+    elif 'blue' in raw_lower:
+        fields['color'] = 'blue palette'
+    elif 'red' in raw_lower:
+        fields['color'] = 'red palette'
+    elif 'monochrome' in raw_lower:
+        fields['color'] = 'monochrome'
+    
+    # Location detection
+    if 'indoor' in raw_lower or 'inside' in raw_lower:
+        fields['location'] = 'indoor'
+    elif 'studio' in raw_lower:
+        fields['location'] = 'studio'
+    elif 'street' in raw_lower:
+        fields['location'] = 'street'
+    elif 'alley' in raw_lower:
+        fields['location'] = 'alleyway'
+    
+    # Lighting detection
+    if 'bright' in raw_lower or 'well-lit' in raw_lower:
+        fields['lighting'] = 'studio light'
+    elif 'dark' in raw_lower or 'dim' in raw_lower:
+        fields['lighting'] = 'low light'
+    elif 'flash' in raw_lower:
+        fields['lighting'] = 'high flash'
+    
+    # Generate extras based on raw caption
+    extras = []
+    if 'confident' in raw_lower:
+        extras.append('confident posture')
+    if 'moody' in raw_lower or 'dramatic' in raw_lower:
+        extras.append('moody atmosphere')
+    if 'urban' in raw_lower:
+        extras.append('urban vibe')
+    
+    # If no extras found, add some generic ones
+    if not extras:
+        extras = ['stylish look', 'contemporary feel']
+    
+    # Construct the structured caption
+    structured_parts = [
+        fields['subject'],
+        fields['framing'],
+        fields['pose'],
+        fields['outfit'],
+        fields['style_tag'],
+        fields['color'],
+        fields['texture'],
+        fields['angle'],
+        fields['camera'],
+        fields['lens'],
+        fields['lighting'],
+        fields['time'],
+        fields['location'],
+        fields['backdrop'],
+        fields['composition'],
+        fields['style']
+    ]
+    
+    # Add extras
+    structured_parts.extend(extras[:3])  # Limit to 3 extras
+    
+    # Add trigger word
+    trigger_word = concept_sentence if concept_sentence else 'streetwear_core'
+    structured_parts.append(trigger_word)
+    
+    return ', '.join(structured_parts)
 
 def recursive_update(d, u):
+    """Recursively update dictionary."""
     for k, v in u.items():
         if isinstance(v, dict) and v:
             d[k] = recursive_update(d.get(k, {}), v)
@@ -162,12 +487,14 @@ def recursive_update(d, u):
             d[k] = v
     return d
 
-
 def resolve_path(p):
+    """Resolve path with quotes for command line usage."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     norm_path = os.path.normpath(os.path.join(current_dir, p))
     return f"\"{norm_path}\""
+
 def resolve_path_without_quotes(p):
+    """Resolve path without quotes."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     norm_path = os.path.normpath(os.path.join(current_dir, p))
     return norm_path
@@ -186,47 +513,57 @@ def gen_sh(
     vram,
     sample_prompts,
     sample_every_n_steps,
+    network_weights=None,
 ):
+    """Generate shell script for training."""
+    try:
+        logger.info(f"Generating training script: network_dim={network_dim}, epochs={max_train_epochs}, vram={vram}")
 
-    print(f"gen_sh: network_dim:{network_dim}, max_train_epochs={max_train_epochs}, save_every_n_epochs={save_every_n_epochs}, timestep_sampling={timestep_sampling}, guidance_scale={guidance_scale}, vram={vram}, sample_prompts={sample_prompts}, sample_every_n_steps={sample_every_n_steps}")
+        line_break = "\\"
+        file_type = "sh"
+        if sys.platform == "win32":
+            line_break = "^"
+            file_type = "bat"
 
+        sample = ""
+        if len(sample_prompts) > 0 and sample_every_n_steps > 0:
+            sample = f"""--sample_prompts={resolve_path('sample_prompts.txt')} --sample_every_n_steps="{sample_every_n_steps}" {line_break}"""
 
-    line_break = "\\"
-    file_type = "sh"
-    if sys.platform == "win32":
-        line_break = "^"
-        file_type = "bat"
+        # Use configurable paths
+        models_dir = config.get_path("models_dir", "models")
+        outputs_dir = config.get_path("outputs_dir", "outputs")
+        
+        pretrained_model_path = resolve_path(f"{models_dir}/unet/flux1-dev-fp8.safetensors")
+        clip_path = resolve_path(f"{models_dir}/clip/clip_l.safetensors")
+        t5_path = resolve_path(f"{models_dir}/clip/t5xxl_fp8.safetensors")
+        ae_path = resolve_path(f"{models_dir}/vae/ae.sft")
+        output_dir = resolve_path(outputs_dir)
 
-    sample = ""
-    if len(sample_prompts) > 0 and sample_every_n_steps > 0:
-        sample = f"""--sample_prompts={resolve_path('sample_prompts.txt')} --sample_every_n_steps="{sample_every_n_steps}" {line_break}"""
+        # Add network weights parameter if existing adapter is provided
+        network_weights_param = ""
+        if network_weights:
+            network_weights_param = f"--network_weights {resolve_path(network_weights)} {line_break}"
 
-    pretrained_model_path = resolve_path("models/unet/flux1-dev-fp8.safetensors")
-    clip_path = resolve_path("models/clip/clip_l.safetensors")
-    t5_path = resolve_path("models/clip/t5xxl_fp8.safetensors")
-    ae_path = resolve_path("models/vae/ae.sft")
-    output_dir = resolve_path("outputs")
-
-    ############# Optimizer args ########################
-    if vram == "16G":
-        # 16G VRAM
-        optimizer = f"""--optimizer_type adafactor {line_break}
+        ############# Optimizer args ########################
+        if vram == "16G":
+            # 16G VRAM
+            optimizer = f"""--optimizer_type adafactor {line_break}
   --optimizer_args "relative_step=False" "scale_parameter=False" "warmup_init=False" {line_break}
   --lr_scheduler constant_with_warmup {line_break}
   --max_grad_norm 0.0 {line_break}"""
-    elif vram == "12G":
-      # 12G VRAM
-        optimizer = f"""--optimizer_type adafactor {line_break}
+        elif vram == "12G":
+          # 12G VRAM
+            optimizer = f"""--optimizer_type adafactor {line_break}
   --optimizer_args "relative_step=False" "scale_parameter=False" "warmup_init=False" {line_break}
   --split_mode {line_break}
   --network_args "train_blocks=single" {line_break}
   --lr_scheduler constant_with_warmup {line_break}
   --max_grad_norm 0.0 {line_break}"""
-    else:
-        # 20G+ VRAM
-        optimizer = f"--optimizer_type adamw8bit {line_break}"
+        else:
+            # 20G+ VRAM
+            optimizer = f"--optimizer_type adamw8bit {line_break}"
 
-    sh = f"""accelerate launch {line_break}
+        sh = f"""accelerate launch {line_break}
   --mixed_precision bf16 {line_break}
   --num_cpu_threads_per_process 1 {line_break}
   sd-scripts/flux_train_network.py {line_break}
@@ -244,7 +581,7 @@ def gen_sh(
   --save_precision bf16 {line_break}
   --network_module networks.lora_flux {line_break}
   --network_dim {network_dim} {line_break}
-  {optimizer}{sample}
+  {network_weights_param}{optimizer}{sample}
   --learning_rate {learning_rate} {line_break}
   --cache_text_encoder_outputs {line_break}
   --cache_text_encoder_outputs_to_disk {line_break}
@@ -260,15 +597,15 @@ def gen_sh(
   --model_prediction_type raw {line_break}
   --guidance_scale {guidance_scale} {line_break}
   --loss_type l2 {line_break}"""
-    return sh
+        return sh
+    except Exception as e:
+        logger.error(f"Error generating shell script: {e}")
+        raise gr.Error(f"Error generating training script: {str(e)}")
 
-def gen_toml(
-  dataset_folder,
-  resolution,
-  class_tokens,
-  num_repeats
-):
-    toml = f"""[general]
+def gen_toml(dataset_folder, resolution, class_tokens, num_repeats):
+    """Generate TOML configuration for training."""
+    try:
+        toml = f"""[general]
 shuffle_caption = false
 caption_extension = '.txt'
 keep_tokens = 1
@@ -282,68 +619,89 @@ keep_tokens = 1
   image_dir = '{resolve_path_without_quotes(dataset_folder)}'
   class_tokens = '{class_tokens}'
   num_repeats = {num_repeats}"""
-    return toml
+        return toml
+    except Exception as e:
+        logger.error(f"Error generating TOML config: {e}")
+        raise gr.Error(f"Error generating dataset config: {str(e)}")
 
 def update_total_steps(max_train_epochs, num_repeats, images):
+    """Calculate and update total training steps."""
     try:
-        num_images = len(images)
+        num_images = len(images) if images else 0
         total_steps = max_train_epochs * num_images * num_repeats
-        print(f"max_train_epochs={max_train_epochs} num_images={num_images}, num_repeats={num_repeats}, total_steps={total_steps}")
-        return gr.update(value = total_steps)
-    except:
-        print("")
+        logger.info(f"Training steps calculation: epochs={max_train_epochs}, images={num_images}, repeats={num_repeats}, total={total_steps}")
+        return gr.update(value=total_steps)
+    except Exception as e:
+        logger.error(f"Error updating total steps: {e}")
+        return gr.update(value=0)
 
 def get_samples():
+    """Get sample images from outputs directory."""
     try:
-        samples_path = resolve_path_without_quotes('outputs/sample')
+        outputs_dir = config.get_path("outputs_dir", "outputs")
+        samples_path = resolve_path_without_quotes(os.path.join(outputs_dir, 'sample'))
+        
+        if not os.path.exists(samples_path):
+            return []
+            
         files = [os.path.join(samples_path, file) for file in os.listdir(samples_path)]
         files.sort(key=lambda file: os.path.getctime(file), reverse=True)
-        print(f"files={files}")
+        logger.info(f"Found {len(files)} sample files")
         return files
-    except:
+    except Exception as e:
+        logger.error(f"Error getting samples: {e}")
         return []
 
-def start_training(
-    train_script,
-    train_config,
-    sample_prompts,
-):
-    # write custom script and toml
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("outputs", exist_ok=True)
+def start_training(train_script, train_config, sample_prompts):
+    """Start the training process."""
+    try:
+        # Create necessary directories
+        models_dir = config.get_path("models_dir", "models")
+        outputs_dir = config.get_path("outputs_dir", "outputs")
+        
+        os.makedirs(models_dir, exist_ok=True)
+        os.makedirs(outputs_dir, exist_ok=True)
 
-    file_type = "sh"
-    if sys.platform == "win32":
-        file_type = "bat"
+        file_type = "sh"
+        if sys.platform == "win32":
+            file_type = "bat"
 
-    sh_filename = f"train.{file_type}"
-    with open(sh_filename, 'w', encoding="utf-8") as file:
-        file.write(train_script)
-    gr.Info(f"Generated train script at {sh_filename}")
+        sh_filename = f"train.{file_type}"
+        with open(sh_filename, 'w', encoding="utf-8") as file:
+            file.write(train_script)
+        gr.Info(f"Generated train script at {sh_filename}")
 
-    with open('dataset.toml', 'w', encoding="utf-8") as file:
-        file.write(train_config)
-    gr.Info(f"Generated dataset.toml")
+        with open('dataset.toml', 'w', encoding="utf-8") as file:
+            file.write(train_config)
+        gr.Info("Generated dataset.toml")
 
-    with open('sample_prompts.txt', 'w', encoding='utf-8') as file:
-        file.write(sample_prompts)
-    gr.Info(f"Generated sample_prompts.txt")
+        with open('sample_prompts.txt', 'w', encoding='utf-8') as file:
+            file.write(sample_prompts)
+        gr.Info("Generated sample_prompts.txt")
 
-    # Train
-    if sys.platform == "win32":
-        command = resolve_path_without_quotes('train.bat')
-    else:
-        command = f"bash {resolve_path('train.sh')}"
+        # Train
+        if sys.platform == "win32":
+            command = resolve_path_without_quotes('train.bat')
+        else:
+            command = f"bash {resolve_path('train.sh')}"
 
-    # Use Popen to run the command and capture output in real-time
-    env = os.environ.copy()
-    env['PYTHONIOENCODING'] = 'utf-8'
-    runner = LogsViewRunner()
-    cwd = os.path.dirname(os.path.abspath(__file__))
-    gr.Info(f"Started training")
-    yield from runner.run_command([command], cwd=cwd)
-    yield runner.log(f"Runner: {runner}")
-    gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
+        # Use Popen to run the command and capture output in real-time
+        env = os.environ.copy()
+        env['PYTHONIOENCODING'] = 'utf-8'
+        runner = LogsViewRunner()
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        gr.Info("Started training")
+        
+        logger.info("Training process started")
+        yield from runner.run_command([command], cwd=cwd)
+        yield runner.log(f"Runner: {runner}")
+        gr.Info("Training Complete. Check the outputs folder for the LoRA files.", duration=None)
+        logger.info("Training process completed")
+        
+    except Exception as e:
+        logger.error(f"Error starting training: {e}")
+        logger.error(traceback.format_exc())
+        gr.Error(f"Error starting training: {str(e)}")
 
 def update(
     lora_name,
@@ -362,35 +720,44 @@ def update(
     sample_prompts,
     sample_every_n_steps,
 ):
-    output_name = slugify(lora_name)
-    dataset_folder = str(f"datasets/{output_name}")
-    sh = gen_sh(
-        output_name,
-        resolution,
-        seed,
-        workers,
-        learning_rate,
-        network_dim,
-        max_train_epochs,
-        save_every_n_epochs,
-        timestep_sampling,
-        guidance_scale,
-        vram,
-        sample_prompts,
-        sample_every_n_steps,
-    )
-    toml = gen_toml(
-        dataset_folder,
-        resolution,
-        class_tokens,
-        num_repeats
-    )
-    return gr.update(value=sh), gr.update(value=toml), dataset_folder
+    """Update training configuration."""
+    try:
+        output_name = slugify(lora_name)
+        datasets_dir = config.get_path("datasets_dir", "datasets")
+        dataset_folder = os.path.join(datasets_dir, output_name)
+        
+        sh = gen_sh(
+            output_name,
+            resolution,
+            seed,
+            workers,
+            learning_rate,
+            network_dim,
+            max_train_epochs,
+            save_every_n_epochs,
+            timestep_sampling,
+            guidance_scale,
+            vram,
+            sample_prompts,
+            sample_every_n_steps,
+        )
+        toml = gen_toml(
+            dataset_folder,
+            resolution,
+            class_tokens,
+            num_repeats
+        )
+        return gr.update(value=sh), gr.update(value=toml), dataset_folder
+    except Exception as e:
+        logger.error(f"Error updating configuration: {e}")
+        raise gr.Error(f"Error updating configuration: {str(e)}")
 
 def loaded():
-    print("launched")
+    """Called when the interface is loaded."""
+    logger.info("Application launched successfully")
 
 def update_sample(concept_sentence):
+    """Update sample prompts with concept sentence."""
     return gr.update(value=concept_sentence)
 
 theme = gr.themes.Monochrome(
@@ -511,14 +878,21 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
             with gr.Group():
                 images = gr.File(
                     file_types=["image", ".txt"],
-                    label="Upload your images",
+                    label="Upload your images (or place directly in datasets folder)",
                     file_count="multiple",
                     interactive=True,
                     visible=True,
                     scale=1,
+                    # Add upload optimization
+                    max_file_size="10MB",  # Limit individual file size
+                    # Note: For 300+ images, consider using direct folder method below
                 )
+                gr.Markdown("""
+**💡 For 300+ images:** Instead of uploading here, copy your images directly to:
+`datasets/[your-lora-name]/` folder for much faster processing.
+""", elem_classes="info-message")
             with gr.Group(visible=False) as captioning_area:
-                do_captioning = gr.Button("Add AI captions with Florence-2")
+                do_captioning = gr.Button("Add AI captions with Gemini")
                 output_components.append(captioning_area)
                 #output_components = [captioning_area]
                 caption_list = []
