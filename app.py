@@ -883,9 +883,6 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     interactive=True,
                     visible=True,
                     scale=1,
-                    # Add upload optimization
-                    max_file_size="10MB",  # Limit individual file size
-                    # Note: For 300+ images, consider using direct folder method below
                 )
                 gr.Markdown("""
 **💡 For 300+ images:** Instead of uploading here, copy your images directly to:
