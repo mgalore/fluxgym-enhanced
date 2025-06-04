@@ -237,6 +237,44 @@ Keep the caption concise but descriptive for training purposes."""
 
         captions = list(captions)
         
+        # Handle different sources of images
+        image_paths = []
+        
+        if images is not None and images != [] and len(images) > 0:
+            # If images were uploaded via file component
+            logger.info("Processing uploaded images...")
+            if isinstance(images, list):
+                image_paths = [img.name if hasattr(img, 'name') else img for img in images]
+            else:
+                image_paths = [images.name if hasattr(images, 'name') else images]
+        else:
+            # If images are already in dataset (from detect_existing_images)
+            logger.info("No uploaded images found, collecting from dataset display...")
+            
+            # We need to collect image paths from the dataset folder
+            # Try to get images from the default dataset structure
+            datasets_dir = "datasets"
+            
+            # Look for any dataset folder with images
+            if os.path.exists(datasets_dir):
+                for folder_name in os.listdir(datasets_dir):
+                    folder_path = os.path.join(datasets_dir, folder_name)
+                    if os.path.isdir(folder_path):
+                        # Get all image files in this folder
+                        for file in os.listdir(folder_path):
+                            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
+                                image_paths.append(os.path.join(folder_path, file))
+                        
+                        # If we found images in this folder, use them
+                        if image_paths:
+                            logger.info(f"Found {len(image_paths)} images in dataset folder: {folder_path}")
+                            break
+            
+            if not image_paths:
+                raise gr.Error("No images found! Please upload images or use 'Detect Existing Images' first.")
+        
+        logger.info(f"Processing {len(image_paths)} images for captioning...")
+        
         # Create captions directory if it doesn't exist
         captions_dir = config.get_path("captions_dir", "generated_captions")
         os.makedirs(captions_dir, exist_ok=True)
@@ -251,8 +289,8 @@ Keep the caption concise but descriptive for training purposes."""
         
         logger.info("🚀 Starting Gemini AI captioning...")
         
-        for i, image_path in enumerate(images):
-            logger.info(f"Processing image {i+1}/{len(images)}: {os.path.basename(image_path)}")
+        for i, image_path in enumerate(image_paths):
+            logger.info(f"Processing image {i+1}/{len(image_paths)}: {os.path.basename(image_path)}")
             if isinstance(image_path, str):  # If image is a file path
                 image_pil = Image.open(image_path).convert("RGB")
 
@@ -286,15 +324,26 @@ Keep the caption concise but descriptive for training purposes."""
                 # Fallback caption
                 structured_caption = f"person, full-body, standing, casual wear, {concept_sentence if concept_sentence else 'streetwear_core'}, neutral tones, cotton, eye-level, DSLR, portrait lens, natural light, daylight, outdoor, urban setting, solo, lookbook style, casual vibe, {concept_sentence if concept_sentence else 'streetwear_core'}"
             
-            captions[i] = structured_caption
+            # Update the caption in the UI if we have enough caption fields
+            if i < len(captions):
+                captions[i] = structured_caption
             
-            # Save individual caption file
+            # Save individual caption file in the same directory as the image
             image_filename = os.path.basename(image_path)
             image_name = os.path.splitext(image_filename)[0]
-            caption_filename = f"{image_name}_caption.txt"
-            caption_filepath = os.path.join(captions_dir, caption_filename)
+            image_dir = os.path.dirname(image_path)
+            
+            # Save .txt file alongside the image
+            caption_filepath = os.path.join(image_dir, f"{image_name}.txt")
             
             with open(caption_filepath, 'w', encoding='utf-8') as f:
+                f.write(structured_caption)
+            
+            # Also save in captions directory for backup
+            caption_filename = f"{image_name}_caption.txt"
+            backup_caption_filepath = os.path.join(captions_dir, caption_filename)
+            
+            with open(backup_caption_filepath, 'w', encoding='utf-8') as f:
                 f.write(structured_caption)
             
             # Store data for master file
@@ -304,7 +353,7 @@ Keep the caption concise but descriptive for training purposes."""
                 'structured_caption': structured_caption
             })
             
-            logger.info(f"💾 Saved caption to: {caption_filename}")
+            logger.info(f"💾 Saved caption to: {caption_filepath}")
 
             yield captions
         
@@ -334,6 +383,7 @@ Keep the caption concise but descriptive for training purposes."""
         
         logger.info(f"🎉 Master captions file saved to: {master_captions_file}")
         logger.info(f"📁 Individual caption files saved in: {captions_dir}")
+        logger.info(f"💾 Caption .txt files saved alongside images in dataset folder")
         logger.info("✨ Gemini captioning completed successfully!")
         
     except Exception as e:
