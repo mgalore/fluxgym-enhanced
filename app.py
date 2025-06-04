@@ -760,6 +760,43 @@ def update_sample(concept_sentence):
     """Update sample prompts with concept sentence."""
     return gr.update(value=concept_sentence)
 
+def detect_existing_images(lora_name, concept_sentence):
+    """Detect and load existing images from dataset folder."""
+    try:
+        if not lora_name:
+            raise gr.Error("Please enter a LoRA name first")
+        
+        # Get dataset folder path
+        datasets_dir = config.get_path("datasets_dir", "datasets")
+        dataset_folder = os.path.join(datasets_dir, slugify(lora_name))
+        
+        if not os.path.exists(dataset_folder):
+            raise gr.Error(f"Dataset folder not found: {dataset_folder}")
+        
+        # Find existing images
+        existing_images = []
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+        
+        for file in os.listdir(dataset_folder):
+            if any(file.lower().endswith(ext) for ext in image_extensions):
+                existing_images.append(os.path.join(dataset_folder, file))
+        
+        if not existing_images:
+            raise gr.Error(f"No images found in {dataset_folder}")
+        
+        if len(existing_images) > MAX_IMAGES:
+            existing_images = existing_images[:MAX_IMAGES]
+            gr.Warning(f"Found {len(os.listdir(dataset_folder))} images, showing first {MAX_IMAGES}")
+        
+        gr.Info(f"Found {len(existing_images)} images in dataset folder!")
+        
+        # Call load_captioning with the detected images
+        return load_captioning(existing_images, concept_sentence)
+        
+    except Exception as e:
+        logger.error(f"Error detecting existing images: {e}")
+        raise gr.Error(f"Error detecting images: {str(e)}")
+
 theme = gr.themes.Monochrome(
     text_size=gr.themes.Size(lg="18px", md="15px", sm="13px", xl="22px", xs="12px", xxl="24px", xxs="9px"),
     font=[gr.themes.GoogleFont("Source Sans Pro"), "ui-sans-serif", "system-ui", "sans-serif"],
@@ -888,6 +925,10 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
 **💡 For 300+ images:** Instead of uploading here, copy your images directly to:
 `datasets/[your-lora-name]/` folder for much faster processing.
 """, elem_classes="info-message")
+                
+                # Add button to detect existing images
+                detect_existing = gr.Button("🔍 Detect Existing Images in Dataset Folder", variant="secondary")
+                
             with gr.Group(visible=False) as captioning_area:
                 do_captioning = gr.Button("Add AI captions with Gemini")
                 output_components.append(captioning_area)
@@ -1015,6 +1056,14 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     )
 
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
+    
+    # Add detect existing images button handler
+    detect_existing.click(
+        fn=detect_existing_images, 
+        inputs=[lora_name, concept_sentence], 
+        outputs=output_components
+    )
+    
     demo.load(fn=loaded, js=js)
 
 if __name__ == "__main__":
