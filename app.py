@@ -44,6 +44,7 @@ from huggingface_hub import hf_hub_download
 try:
     GOOGLE_API_KEY = config.get_api_key("google_api_key")
     MAX_IMAGES = config.get_setting("max_images", 150)
+    PRETRAINED_ADAPTERS_DIR = config.get_path("pretrained_adapters_dir", "pretrained_adapters")
     logger.info("Configuration loaded successfully")
 except ConfigurationError as e:
     logger.error(f"Configuration error: {e}")
@@ -59,6 +60,9 @@ except ConfigurationError as e:
     print("3. You can get a Google API key from: https://makersuite.google.com/app/apikey")
     print("="*60)
     sys.exit(1)
+
+# Create pretrained adapters directory if it doesn't exist
+os.makedirs(PRETRAINED_ADAPTERS_DIR, exist_ok=True)
 
 def load_captioning(uploaded_files, concept_sentence):
     """Load and process uploaded files for captioning."""
@@ -769,12 +773,18 @@ def update(
     num_repeats,
     sample_prompts,
     sample_every_n_steps,
+    pretrained_adapter,
 ):
     """Update training configuration."""
     try:
         output_name = slugify(lora_name)
         datasets_dir = config.get_path("datasets_dir", "datasets")
         dataset_folder = os.path.join(datasets_dir, output_name)
+        
+        # Set network_weights if pretrained adapter is selected
+        network_weights = None
+        if pretrained_adapter and pretrained_adapter != "None":
+            network_weights = os.path.join(PRETRAINED_ADAPTERS_DIR, pretrained_adapter)
         
         sh = gen_sh(
             output_name,
@@ -790,6 +800,7 @@ def update(
             vram,
             sample_prompts,
             sample_every_n_steps,
+            network_weights,
         )
         toml = gen_toml(
             dataset_folder,
@@ -846,6 +857,78 @@ def detect_existing_images(lora_name, concept_sentence):
     except Exception as e:
         logger.error(f"Error detecting existing images: {e}")
         raise gr.Error(f"Error detecting images: {str(e)}")
+
+def get_available_adapters():
+    """Get list of available pretrained adapters."""
+    adapters = []
+    if os.path.exists(PRETRAINED_ADAPTERS_DIR):
+        for file in os.listdir(PRETRAINED_ADAPTERS_DIR):
+            if file.endswith('.safetensors'):
+                adapters.append(file)
+    return sorted(adapters)
+
+def upload_pretrained_adapter(files):
+    """Handle uploaded pretrained adapter files."""
+    if not files:
+        return gr.update(choices=get_available_adapters(), value=None), "No files uploaded"
+    
+    uploaded_count = 0
+    for file in files:
+        if file.name.endswith('.safetensors'):
+            try:
+                # Copy to pretrained adapters directory
+                dest_path = os.path.join(PRETRAINED_ADAPTERS_DIR, os.path.basename(file.name))
+                shutil.copy2(file.name, dest_path)
+                uploaded_count += 1
+                logger.info(f"Uploaded adapter: {os.path.basename(file.name)}")
+            except Exception as e:
+                logger.error(f"Error uploading {file.name}: {e}")
+    
+    message = f"✅ Successfully uploaded {uploaded_count} adapter(s)" if uploaded_count > 0 else "❌ No valid .safetensors files found"
+    return gr.update(choices=get_available_adapters(), value=None), message
+
+def delete_adapter(adapter_name):
+    """Delete a pretrained adapter."""
+    if not adapter_name:
+        return gr.update(choices=get_available_adapters(), value=None), "No adapter selected"
+    
+    try:
+        adapter_path = os.path.join(PRETRAINED_ADAPTERS_DIR, adapter_name)
+        if os.path.exists(adapter_path):
+            os.remove(adapter_path)
+            logger.info(f"Deleted adapter: {adapter_name}")
+            return gr.update(choices=get_available_adapters(), value=None), f"✅ Deleted: {adapter_name}"
+        else:
+            return gr.update(choices=get_available_adapters(), value=None), f"❌ Adapter not found: {adapter_name}"
+    except Exception as e:
+        logger.error(f"Error deleting adapter {adapter_name}: {e}")
+        return gr.update(choices=get_available_adapters(), value=None), f"❌ Error deleting: {str(e)}"
+
+def get_adapter_info(adapter_name):
+    """Get information about a selected adapter."""
+    if not adapter_name:
+        return "No adapter selected"
+    
+    adapter_path = os.path.join(PRETRAINED_ADAPTERS_DIR, adapter_name)
+    if os.path.exists(adapter_path):
+        try:
+            file_size = os.path.getsize(adapter_path)
+            file_size_mb = file_size / (1024 * 1024)
+            mod_time = os.path.getmtime(adapter_path)
+            mod_time_str = gr.utils.format_datetime(mod_time)
+            
+            return f"""📁 **Adapter Info:**
+**File:** {adapter_name}
+**Size:** {file_size_mb:.2f} MB
+**Modified:** {mod_time_str}
+**Path:** `{adapter_path}`
+
+💡 **Training Mode:** Continue training from this adapter
+⚠️ **Note:** Make sure this adapter is compatible with FLUX"""
+        except Exception as e:
+            return f"❌ Error reading adapter info: {str(e)}"
+    else:
+        return "❌ Adapter file not found"
 
 theme = gr.themes.Monochrome(
     text_size=gr.themes.Size(lg="18px", md="15px", sm="13px", xl="22px", xs="12px", xxl="24px", xxs="9px"),
@@ -957,6 +1040,47 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     #            steps = gr.Number(label="Steps", value=1000, minimum=1, maximum=10000, step=1)
                 network_dim = gr.Number(label="LoRA Rank", value=4, minimum=4, maximum=128, step=4, interactive=True)
                 resolution = gr.Number(value=512, precision=0, label="Resize dataset images")
+            
+            # Pretrained Adapter Section
+            gr.Markdown(
+                """## 🔄 Pretrained Adapter (Optional)
+<p style="margin-top:0">Continue training from an existing LoRA adapter.</p>
+""", elem_classes="group_padding")
+            
+            with gr.Group():
+                with gr.Row():
+                    pretrained_adapter = gr.Dropdown(
+                        choices=["None"] + get_available_adapters(),
+                        value="None",
+                        label="Select Existing Adapter",
+                        info="Choose an adapter to continue training from",
+                        interactive=True,
+                        scale=2
+                    )
+                    refresh_adapters = gr.Button("🔄 Refresh", variant="secondary", scale=1)
+                
+                with gr.Row():
+                    upload_adapter = gr.File(
+                        file_types=[".safetensors"],
+                        label="Upload New Adapter (.safetensors)",
+                        file_count="multiple",
+                        interactive=True,
+                        scale=2
+                    )
+                    delete_adapter_btn = gr.Button("🗑️ Delete Selected", variant="stop", scale=1)
+                
+                adapter_info = gr.Markdown("No adapter selected", elem_classes="info-message")
+                upload_status = gr.Textbox(label="Upload Status", interactive=False, visible=False)
+                
+                gr.Markdown("""
+**💡 How to use:**
+- **Upload**: Drop your `.safetensors` LoRA files above
+- **Select**: Choose an adapter from the dropdown
+- **Train**: The selected adapter will be used as starting point
+- **Folder**: You can also place adapters in `pretrained_adapters/` folder
+
+**⚠️ Note:** Make sure the adapter is compatible with FLUX and uses similar settings
+""", elem_classes="info-message")
         with gr.Column():
             gr.Markdown(
                 """# Step 2. Dataset
@@ -1039,6 +1163,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         num_repeats,
         sample_prompts,
         sample_every_n_steps,
+        pretrained_adapter,
     ]
 
 
@@ -1114,6 +1239,30 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         outputs=output_components
     )
     
+    # Pretrained Adapter Event Handlers
+    upload_adapter.upload(
+        fn=upload_pretrained_adapter,
+        inputs=[upload_adapter],
+        outputs=[pretrained_adapter, upload_status]
+    )
+    
+    refresh_adapters.click(
+        fn=lambda: gr.update(choices=["None"] + get_available_adapters()),
+        outputs=[pretrained_adapter]
+    )
+    
+    delete_adapter_btn.click(
+        fn=delete_adapter,
+        inputs=[pretrained_adapter],
+        outputs=[pretrained_adapter, upload_status]
+    )
+    
+    pretrained_adapter.change(
+        fn=get_adapter_info,
+        inputs=[pretrained_adapter],
+        outputs=[adapter_info]
+    )
+
     demo.load(fn=loaded, js=js)
 
 if __name__ == "__main__":
