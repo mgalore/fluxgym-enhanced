@@ -1,6 +1,5 @@
 safetensors>=0.3.0
-git+https://github.com/huggingface/diffusers.git
-gradio_logsview==0.0.17
+diffusers==0.21.4
 transformers>=4.30.0
 lycoris-lora==1.8.3
 flatten_json
@@ -27,7 +26,7 @@ lpips
 pytorch_fid
 optimum-quanto
 sentencepiece
-huggingface_hub>=0.16.0
+huggingface_hub==0.17.3
 peft
 gradio==4.44.0
 python-slugify>=6.0.0
