@@ -37,7 +37,8 @@ import shutil
 import json
 import yaml
 from slugify import slugify
-from gradio_logsview import LogsView, LogsViewRunner
+# Removed gradio_logsview due to compatibility issues
+# Using simple textbox for logging instead
 from huggingface_hub import hf_hub_download
 
 # Load configuration settings
@@ -739,18 +740,51 @@ def start_training(train_script, train_config, sample_prompts):
         else:
             command = f"bash {resolve_path('train.sh')}"
 
-        # Use Popen to run the command and capture output in real-time
+        # Run the training command
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
-        runner = LogsViewRunner()
         cwd = os.path.dirname(os.path.abspath(__file__))
         gr.Info("Started training")
         
         logger.info("Training process started")
-        yield from runner.run_command([command], cwd=cwd)
-        yield runner.log(f"Runner: {runner}")
-        gr.Info("Training Complete. Check the outputs folder for the LoRA files.", duration=None)
-        logger.info("Training process completed")
+        
+        # Simple subprocess execution without real-time logging
+        try:
+            process = subprocess.Popen(
+                command, 
+                shell=True, 
+                cwd=cwd, 
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            output_lines = []
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    output_lines.append(output.strip())
+                    logger.info(output.strip())
+                    # Yield progress update
+                    yield "\n".join(output_lines[-50:])  # Show last 50 lines
+            
+            return_code = process.poll()
+            if return_code == 0:
+                gr.Info("Training Complete. Check the outputs folder for the LoRA files.", duration=None)
+                logger.info("Training process completed successfully")
+            else:
+                gr.Error(f"Training failed with return code: {return_code}")
+                logger.error(f"Training process failed with return code: {return_code}")
+                
+        except Exception as e:
+            logger.error(f"Error running training command: {e}")
+            gr.Error(f"Training failed: {str(e)}")
+            yield f"Error: {str(e)}"
         
     except Exception as e:
         logger.error(f"Error starting training: {e}")
@@ -1140,7 +1174,15 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
             train_script = gr.Textbox(label="Train script", max_lines=100, interactive=True)
             train_config = gr.Textbox(label="Train config", max_lines=100, interactive=True)
     with gr.Row():
-        terminal = LogsView(label="Train log", elem_id="terminal")
+        terminal = gr.Textbox(
+            label="Train log", 
+            elem_id="terminal",
+            lines=15,
+            max_lines=15,
+            interactive=False,
+            autoscroll=True,
+            show_copy_button=True
+        )
     with gr.Row():
         gallery = gr.Gallery(get_samples, label="Samples", every=10, columns=6)
 
