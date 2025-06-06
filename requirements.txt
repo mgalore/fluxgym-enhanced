@@ -1,6 +1,6 @@
 safetensors>=0.3.0
 git+https://github.com/huggingface/diffusers.git
-gradio_logsview@https://huggingface.co/spaces/cocktailpeanut/gradio_logsview/resolve/main/gradio_logsview-0.0.17-py3-none-any.whl
+gradio_logsview==0.0.17
 transformers>=4.30.0
 lycoris-lora==1.8.3
 flatten_json
@@ -29,7 +29,7 @@ optimum-quanto
 sentencepiece
 huggingface_hub>=0.16.0
 peft
-gradio>=4.0.0
+gradio==4.44.0
 python-slugify>=6.0.0
 imagesize
 google-generativeai>=0.3.0
