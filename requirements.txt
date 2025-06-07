@@ -1,6 +1,6 @@
 safetensors>=0.3.0
-diffusers==0.21.4
-transformers>=4.30.0
+diffusers>=0.21.0,<0.30.0
+transformers>=4.30.0,<5.0.0
 lycoris-lora==1.8.3
 flatten_json
 pyyaml
@@ -18,7 +18,7 @@ k-diffusion
 open_clip_torch
 timm
 prodigyopt
-controlnet_aux==0.0.7
+controlnet_aux>=0.0.6
 python-dotenv
 bitsandbytes
 hf_transfer
@@ -26,9 +26,9 @@ lpips
 pytorch_fid
 optimum-quanto
 sentencepiece
-huggingface_hub==0.17.3
+huggingface_hub>=0.16.0,<0.25.0
 peft
-gradio==4.44.0
+gradio>=4.0.0,<5.0.0
 python-slugify>=6.0.0
 imagesize
 google-generativeai>=0.3.0
