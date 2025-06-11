@@ -949,7 +949,8 @@ def get_adapter_info(adapter_name):
             file_size = os.path.getsize(adapter_path)
             file_size_mb = file_size / (1024 * 1024)
             mod_time = os.path.getmtime(adapter_path)
-            mod_time_str = gr.utils.format_datetime(mod_time)
+            from datetime import datetime
+            mod_time_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
             
             return f"""📁 **Adapter Info:**
 **File:** {adapter_name}
