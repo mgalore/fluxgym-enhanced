@@ -1,5 +1,5 @@
 safetensors>=0.3.0
-diffusers>=0.21.0,<0.30.0
+diffusers>=0.30.0
 transformers>=4.30.0,<5.0.0
 lycoris-lora==1.8.3
 flatten_json
@@ -26,7 +26,7 @@ lpips
 pytorch_fid
 optimum-quanto
 sentencepiece
-huggingface_hub>=0.16.0,<0.25.0
+huggingface_hub>=0.25.0
 peft
 gradio>=4.0.0,<5.0.0
 python-slugify>=6.0.0
